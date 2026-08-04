@@ -1,0 +1,16 @@
+# Python 3.11. Install torch matching your CUDA first (see README), then:
+#   pip install -r requirements.txt
+torch>=2.5
+torchvision
+timm
+onnxruntime            # or onnxruntime-gpu if you have a CUDA GPU
+opencv-contrib-python
+ultralytics
+rembg
+pillow-heif
+scikit-image
+scipy>=1.14
+numpy
+openpyxl
+huggingface_hub
+safetensors
