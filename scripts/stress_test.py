@@ -4,6 +4,7 @@ import numpy as np, cv2
 from collections import defaultdict
 from pathlib import Path
 from ultralytics import YOLO
+from cartgate import config
 from cartgate.embed import get_embedder
 from cartgate.gallery import build_gallery
 from cartgate.synth import synth_cart_frames
@@ -54,7 +55,7 @@ def run_cfg(model, gallery, embedder, cutouts, n_items, qual, dev, n_carts=40, s
         for f in synth_cart_frames(cart, cutouts, rng, n_frames=1, size=(640, 640)):
             buried += len(cart) - len(f.objects)             # occlusion-aware GT dropped these
             img = degrade(f.image, qual, rng)
-            res = model.predict(img, conf=0.25, verbose=False, device=dev)[0]
+            res = model.predict(img, conf=config.DET_CONF, verbose=False, device=dev)[0]
             dets = [tuple(int(v) for v in b) for b in res.boxes.xyxy.cpu().numpy()]
             for o in f.objects:
                 vis += 1

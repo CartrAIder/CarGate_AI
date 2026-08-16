@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from cartgate import config
+
 
 # ---------- similarity ----------
 
@@ -161,8 +163,8 @@ def _resolve(tracks: dict, pass_sim: float, review_sim: float, min_frames: int) 
 
 
 def decide_cart(tracks: dict, receipt: dict[str, int], *,
-                pass_sim: float = 0.60, review_sim: float = 0.45,
-                min_frames: int = 2) -> dict:
+                pass_sim: float = config.PASS_SIM, review_sim: float = config.REVIEW_SIM,
+                min_frames: int = config.MIN_FRAMES) -> dict:
     """Receipt-conditioned, occlusion-tolerant exit-gate decision -> PASS/FLAG/REVIEW.
 
       * Paid-but-unseen items are expected (can't see a full cart) -> never penalized.

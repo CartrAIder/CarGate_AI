@@ -10,14 +10,13 @@ import cv2, numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
 
+from cartgate.config import PASS_SIM, REVIEW_SIM      # single source of truth
 from cartgate.embed import get_embedder
 from cartgate.gallery import build_gallery
 from cartgate.synth import synth_cart_frames
 from cartgate.match import sku_similarity
 
 FONT_PATH = sorted(glob.glob("/usr/share/fonts/truetype/nanum/NanumGothic*.ttf"))[0]
-# similarity bands for box colouring
-PASS_SIM, REVIEW_SIM = 0.55, 0.42
 COL = {"ok": (34, 197, 94), "review": (234, 179, 8), "wrong": (239, 68, 68), "miss": (148, 163, 184)}
 
 
