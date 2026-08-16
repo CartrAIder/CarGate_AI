@@ -30,5 +30,4 @@ def verify_items(paid_items: Iterable[PaidItem], observation: VisionObservation)
     if unknown:
         reasons.append(f"{sum(item.quantity for item in unknown)} unknown item(s) detected")
     decision = Decision.REVIEW if unexpected or unknown else Decision.PASS
-    #PASS 또는 REVIEW를 반환하는 코드만 존재
-    #외부 API 호출은 구현 X 
+    return VerificationResult(decision, unexpected, unknown, tuple(reasons))
