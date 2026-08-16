@@ -1,6 +1,7 @@
 """Build the SKU embedding gallery from dataset/<sku>/<images>. Each image is
 expanded into rotation/flip variants so one studio shot still matches field crops
 seen at arbitrary rotation."""
+import hashlib
 import json
 import pickle
 from pathlib import Path
@@ -11,6 +12,23 @@ import numpy as np
 from cartgate.segment import remove_background, crop_to_object
 
 ROTATIONS = [0, 45, 90, 135, 180, 225, 270, 315]
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _fingerprint(dataset_dir: str, cutouts_dir: str, params: dict) -> str:
+    """Identity of a gallery build: every source image (path/mtime/size) plus the
+    build parameters. Any edited, added or removed photo changes it."""
+    h = hashlib.sha256()
+    h.update(json.dumps(params, sort_keys=True).encode())
+    for root in (dataset_dir, cutouts_dir):
+        p = Path(root)
+        if not p.exists():
+            continue
+        for f in sorted(p.rglob("*")):
+            if f.is_file() and f.suffix.lower() in IMG_EXTS:
+                st = f.stat()
+                h.update(f"{f.relative_to(p)}|{st.st_mtime_ns}|{st.st_size}".encode())
+    return h.hexdigest()
 
 
 def rotate_rgba(rgba: np.ndarray, deg: float) -> np.ndarray:
@@ -27,7 +45,7 @@ def rotate_rgba(rgba: np.ndarray, deg: float) -> np.ndarray:
 def build_gallery(dataset_dir: str, embedder, out_dir: str = "out",
                   save_cutouts: bool = True, remove_bg: bool = False,
                   enrich_synth: int = 0, cutouts_dir: str = "out/cut_rembg",
-                  enrich_seed: int = 7) -> dict:
+                  enrich_seed: int = 7, cache: bool = True) -> dict:
     """Returns {sku: {"vectors": [N,D], "views": [...]}}.
 
     remove_bg=False (default) embeds the full studio image with 90-deg rotations +
@@ -35,11 +53,34 @@ def build_gallery(dataset_dir: str, embedder, out_dir: str = "out",
     enrich_synth>0 also appends that many synthetic composite views per cutout
     (object on varied backgrounds), which makes the gallery cover the field-crop
     distribution rather than only clean studio shots.
+
+    cache=True reuses out/gallery.pkl when the source photos and the build
+    parameters are unchanged (rebuilding embeds thousands of views and costs
+    minutes); any edited/added/removed photo invalidates it automatically.
     """
     dataset = Path(dataset_dir)
     out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
     if save_cutouts and remove_bg:
         (out / "cutouts").mkdir(parents=True, exist_ok=True)
+
+    key_file = out / "gallery.key.json"
+    pkl_file = out / "gallery.pkl"
+    key = _fingerprint(dataset_dir, cutouts_dir if enrich_synth > 0 else "", {
+        "remove_bg": remove_bg, "enrich_synth": enrich_synth, "enrich_seed": enrich_seed,
+        "embedder": getattr(embedder, "name", type(embedder).__name__),
+        "rotations": ROTATIONS,
+    })
+    if cache and key_file.exists() and pkl_file.exists():
+        try:
+            if json.loads(key_file.read_text()).get("key") == key:
+                with open(pkl_file, "rb") as f:
+                    gallery = pickle.load(f)
+                print(f"  gallery cache hit ({len(gallery)} SKUs, "
+                      f"{sum(v['vectors'].shape[0] for v in gallery.values())} vectors)")
+                return gallery
+        except Exception as exc:                     # corrupt cache -> just rebuild
+            print(f"  gallery cache unusable ({exc}); rebuilding")
 
     syn_cut = {}
     if enrich_synth > 0:
@@ -97,8 +138,12 @@ def build_gallery(dataset_dir: str, embedder, out_dir: str = "out",
                   f"{sum(1 for v in views if not str(v['src']).startswith('synth'))} studio "
                   f"-> {len(vecs)} gallery vectors")
 
-    with open(out / "gallery.pkl", "wb") as f:
+    with open(pkl_file, "wb") as f:
         pickle.dump(gallery, f)
     with open(out / "gallery_meta.json", "w") as f:
         json.dump({k: {"n_vectors": int(v["vectors"].shape[0])} for k, v in gallery.items()}, f, indent=2)
+    key_file.write_text(json.dumps({
+        "key": key, "n_skus": len(gallery),
+        "n_vectors": int(sum(v["vectors"].shape[0] for v in gallery.values())),
+    }, indent=2))
     return gallery
