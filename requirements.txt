@@ -14,3 +14,4 @@ numpy
 openpyxl
 huggingface_hub
 safetensors
+pytest                 # unit tests (cartgate.verification / fusion)

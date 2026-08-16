@@ -48,13 +48,25 @@ class ClassicalEmbedder:
         ]))
 
 
+def _preload_cuda_libs() -> None:
+    """onnxruntime-gpu's CUDA EP needs libcudnn.so.9 / libcublas on the loader path.
+    Importing torch first pulls its bundled CUDA libraries into the process, which
+    satisfies that; without it ORT silently falls back to CPU (~5x slower here)."""
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        pass
+
+
 class OnnxEmbedder:
     """A CNN/ViT backbone via onnxruntime; the global-pool output is the embedding.
     Set pad=True for aspect-preserving letterbox (needed by ViT/DINOv2)."""
     def __init__(self, onnx_path: str, input_size: int = 224, pad: bool = False):
         import onnxruntime as ort
+        _preload_cuda_libs()
         prov = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.sess = ort.InferenceSession(onnx_path, providers=prov)
+        self.providers = self.sess.get_providers()   # what actually loaded, not what we asked for
         self.input_name = self.sess.get_inputs()[0].name
         self.size = input_size
         self.pad = pad          # letterbox to square instead of stretch
@@ -83,6 +95,27 @@ class OnnxEmbedder:
         x = x.transpose(2, 0, 1)[None]
         out = self.sess.run(None, {self.input_name: x})[0].reshape(-1).astype(np.float32)
         return _l2n(out)
+
+    def _pre(self, bgr: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+        img = bgr
+        if mask is not None:
+            img = bgr.copy()
+            img[mask == 0] = 128
+        rgb = cv2.cvtColor(self._fit(img), cv2.COLOR_BGR2RGB)
+        return ((rgb.astype(np.float32) / 255.0 - self.mean) / self.std).transpose(2, 0, 1)
+
+    def embed_batch(self, crops: list, masks: list | None = None) -> np.ndarray:
+        """Embed several crops in ONE ORT call -> [N, D] L2-normalized.
+
+        The exported graph has a dynamic batch axis, so batching amortizes the
+        per-call overhead; on GPU this is several times faster than looping embed().
+        """
+        if not crops:
+            return np.zeros((0, 0), np.float32)
+        x = np.stack([self._pre(c, None if masks is None else masks[i])
+                      for i, c in enumerate(crops)])
+        out = self.sess.run(None, {self.input_name: x})[0].astype(np.float32)
+        return out / np.clip(np.linalg.norm(out, axis=1, keepdims=True), 1e-12, None)
 
 
 def get_embedder(onnx_path: str | None = None, pad: bool = False):
