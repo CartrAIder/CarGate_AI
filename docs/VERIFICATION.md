@@ -49,5 +49,25 @@ class PaymentRepository:
     def get_paid_items(self, cart_id: str) -> list[PaidItem]: ...
 ```
 
+Payment API JSON can be converted at the boundary with the strict adapter:
+
+```python
+from cartgate.verification import parse_payment_json
+
+payment = parse_payment_json(response.text)
+# payment.order_id: str (payment.cart_id is the same compatibility identifier)
+# payment.status: "PAID"
+# payment.items: tuple[PaidItem, ...]
+```
+
+The expected contract is `{"orderId": str, "status": "PAID", "items":
+[{"productId": positive int, "productName": str, "quantity": positive int}]}`.
+`orderId` is used as the verification cart identifier. Each QuickPass `productId`
+is converted to the CartGate SKU with `f"S{product_id:04d}"` (`1 -> S0001`,
+`101 -> S0101`). The order-item `id` and price/customer fields are ignored.
+`productName` is validated but is not used for matching. An empty `items` array
+is a valid empty receipt. Malformed JSON, a non-PAID status, or invalid fields
+raise `PaymentJsonError` and must not be treated as an empty payment.
+
 Run the deterministic tests with `python -m pytest -q` from the repository root.
 Model weights and camera data are not needed for these unit tests.
