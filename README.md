@@ -130,3 +130,9 @@ python scripts/train_recognition.py                                      # 인�
   (물체를 다양한 배경에 얹어 배경 강건성 확보).
 - 배포 타깃은 Jetson(AGX/Orin) + TensorRT. `export_deploy.py`가 검출기 ONNX를 뽑고,
   `dino_arc.onnx`가 인식 임베더입니다.
+
+## 전체 카탈로그 검증 경로
+
+기존 영수증 조건부 데모는 그대로 유지됩니다. 결제 내역과 독립적으로 전체 갤러리를
+검색한 뒤 결제 DB와 비교하는 별도 경로는 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)를
+참고하세요. 이 경로의 최종 판정은 fail-safe한 `PASS` / `REVIEW` 두 가지입니다.
