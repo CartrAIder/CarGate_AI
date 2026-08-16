@@ -8,7 +8,7 @@
 ## 파이프라인
 
 ```
- 카메라 3대 (상단 1 + 측면 2, ~30fps)
+ 카메라 2대 (양쪽 위 대각선, ~30fps)
         │
         ▼
  [1] 검출(Detector)     YOLO11n, "product" 단일 클래스   → 박스 (클래스 무관)
@@ -17,7 +17,7 @@
  [2] 인식(Recognition)  DINOv2-S/14 + ArcFace 헤드 → 256-d 임베딩,
         │               영수증 SKU에만 대조
         ▼
- [3] 집계(Aggregation)  다중 프레임 추적 + 3카메라 융합 → SKU별 수량
+ [3] 집계(Aggregation)  다중 프레임 추적 + 2카메라 융합 → SKU별 수량
         │
         ▼
  [4] 판정(Decision)     결제 DB와 대조 → PASS / FLAG / REVIEW
@@ -40,8 +40,8 @@ cjs/
 │
 ├─ scripts/               # 실행 진입점 (리포 루트에서 실행)
 │   ├─ ingest.py                # 원본 사진 → dataset/
-│   ├─ make_detect_data.py      # 검출기 학습 데이터 생성
-│   ├─ train_detector.py        # 검출기 학습 (YOLO)
+│   ├─ make_cart_dataset.py     # 합성 카트 데이터셋 (2캠 대각선) — 판정 벤치마크 + 검출기 학습 겸용
+│   ├─ train_detector.py        # 검출기 학습 (YOLO, cart_dataset/data.yaml)
 │   ├─ train_recognition.py     # 인식 임베더 학습 → dino_arc.onnx
 │   ├─ make_paired.py           # 원본 + BiRefNet 누끼 pair 생성
 │   ├─ pipeline.py              # 엔드투엔드 데모 (검출→인식→융합→판정)
@@ -83,13 +83,16 @@ dataset/
   images/<sku_id>__<이름>/*.jpg     상품 사진 (51 SKU) — 갤러리 소스
   barcode/<sku_id>__<이름>.png      상품 바코드
 out/cut_rembg/                      인식 학습용 누끼 (RGBA)
-detect_data/                        검출기 학습용 합성 데이터
+cart_dataset/                       합성 카트 (2캠 대각선) — 판정 벤치마크 + 검출기 학습(YOLO)
 runs/detect/.../weights/best.pt     학습된 검출기
 dino_arc.onnx                       학습된 인식 임베더
 yolo11n.pt                          검출기 베이스 가중치
 ```
 
 `products.csv`(sku_id·상품명·EAN-13 바코드)는 상품 마스터로 git에 포함됩니다.
+
+판정 레이어용 **합성 카트 벤치마크**는 `scripts/make_cart_dataset.py`로 생성합니다
+(`cart_dataset/`: 카트별 영수증·실내용물·카메라별 GT·정답 PASS/FLAG). 포맷은 `cart_dataset/README.md` 참고.
 
 ## 실행
 
@@ -110,8 +113,8 @@ python scripts/build_handoff.py --no-images
 재학습 (GPU):
 
 ```bash
-python scripts/make_detect_data.py && python scripts/train_detector.py   # 검출기
-python scripts/train_recognition.py                                      # 인식 → dino_arc.onnx
+python scripts/make_cart_dataset.py --num 3000 && python scripts/train_detector.py   # 검출기
+python scripts/train_recognition.py                                                  # 인식 → dino_arc.onnx
 ```
 
 ## 현재 성능 (합성 데이터 기준)

@@ -41,7 +41,7 @@ The recognition step already restricts each object to the cart's receipt SKUs, s
 
 - `decide_cart(tracks, receipt, pass_sim, review_sim, min_frames)` — 3-way decision
   with confidence bands, quantity check, and occlusion tolerance.
-- `pipeline.py: fuse_and_decide(...)` — fuses the 3 cameras (max count per SKU) and
+- `pipeline.py: fuse_and_decide(...)` — fuses the 2 cameras (max count per SKU) and
   returns the verdict.
 
 These are rule-based and calibrated on synthetic data. Your job is to harden this
@@ -66,7 +66,7 @@ A single frame is noisy. Aggregate before deciding.
   camera missed to occlusion.
   - Caveat: max cannot tell "same item in 2 views" from "two identical items in
     different spots". Truly counting identical duplicates needs camera geometry
-    (calibrate the 3 cameras once, triangulate box centers). Until then, max is the
+    (calibrate the 2 cameras once, triangulate box centers). Until then, max is the
     safe, calibratable stand-in — document it as a known limitation.
 
 ### 3b. Match visible items to the receipt
@@ -88,7 +88,8 @@ You cannot see everything in a cart, so:
 - **Never** flag a cart because a *paid* item wasn't seen. Missing-and-paid is the
   normal case (buried at the bottom). Only accuse on positive evidence: a **visible**
   item that is unpaid, or **more** confident instances of an item than were paid for.
-- Use the side cameras to reduce blind spots (they see what the top misses).
+- The two cameras view from opposite upper-diagonal angles, so each covers the
+  other's blind spots — an item occluded in one view is often visible in the other.
 - Optional sanity signal: a coarse **cart-fullness / volume estimate** (from the
   top view). It shouldn't accuse on its own, but a gross mismatch — receipt says 2
   items, cart is visibly full — is a good reason to escalate to REVIEW rather than PASS.

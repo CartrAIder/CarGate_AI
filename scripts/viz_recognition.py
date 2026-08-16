@@ -79,7 +79,7 @@ def draw(img_bgr, dets, misses, header):
 def main():
     nm = names_map()
     emb = get_embedder("dino_arc.onnx", pad=True)          # DINOv2+ArcFace, letterbox preprocessing
-    model = YOLO("runs/detect/runs/prod_det_gpu/weights/best.pt")
+    model = YOLO("runs/detector/best.pt")
     gallery = build_gallery("dataset/images", emb, "out", remove_bg=False, enrich_synth=16)
     cutouts = load_cutouts()
     outdir = Path("out/viz"); outdir.mkdir(parents=True, exist_ok=True)

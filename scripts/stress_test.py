@@ -81,7 +81,7 @@ def run_cfg(model, gallery, embedder, cutouts, n_items, qual, dev, n_carts=40, s
 def main():
     dev = 0
     emb = get_embedder("dino_arc.onnx", pad=True)          # DINOv2+ArcFace
-    model = YOLO("runs/detect/runs/prod_det_gpu/weights/best.pt")
+    model = YOLO("runs/detector/best.pt")
     gallery = build_gallery("dataset/images", emb, "out", remove_bg=False, enrich_synth=16)
     cutouts = load_cutouts()
     print(f"\n{'items':>5} {'quality':<16} {'buried%':>7} {'det_recall':>10} {'recog_top1':>10} {'end2end':>8}")

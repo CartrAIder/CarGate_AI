@@ -1,5 +1,5 @@
 """End-to-end demo: detect items in each camera's frames, recognize them against
-the cart's receipt, fuse the 3 cameras, and return a PASS/FLAG/REVIEW verdict.
+the cart's receipt, fuse the 2 cameras, and return a PASS/FLAG/REVIEW verdict.
 
 Counting identical duplicates across cameras really needs camera geometry;
 max-over-cameras is a calibratable stand-in until that lands.
@@ -83,7 +83,7 @@ def resolve_camera(model, frames, embedder, gallery, receipt_skus, dev) -> list[
 
 
 def fuse_and_decide(per_cam: list[list[dict]], receipt: dict[str, int]) -> dict:
-    """Fuse the 3 cameras (max-count per SKU) and return the 3-way verdict."""
+    """Fuse the 2 cameras (max-count per SKU) and return the 3-way verdict."""
     def maxcount(pred):
         return max((sum(1 for r in cam if pred(r)) for cam in per_cam), default=0)
 
@@ -130,12 +130,13 @@ def run(dataset, cutouts_dir, weights, onnx, dev, seed=7):
         ("수량 초과(1결제 2적재)", base + [base[0]], {s: 1 for s in base}, "FLAG"),
         ("결제했지만 가려짐", base[:2], {s: 1 for s in base}, "PASS"),
     ]
-    print("[4/4] gate scenarios (real detection -> 3-camera fusion -> decision)\n")
+    print("[4/4] gate scenarios (real detection -> 2-camera fusion -> decision)\n")
     results = []
     for name, cart, receipt, expect in scenarios:
         per_cam = []
-        for _ in range(3):                       # 1 top + 2 side cameras
-            frames = synth_cart_frames(cart, cutouts, rng, n_frames=4, size=(640, 640))
+        for d in (-1.0, 1.0):                    # 2 upper-diagonal cameras
+            frames = synth_cart_frames(cart, cutouts, rng, n_frames=4, size=(640, 640),
+                                       cam_dirs=[d] * 4)
             per_cam.append(resolve_camera(model, frames, embedder, gallery,
                                           list(receipt.keys()), dev))
         d = fuse_and_decide(per_cam, receipt)
@@ -143,7 +144,7 @@ def run(dataset, cutouts_dir, weights, onnx, dev, seed=7):
         results.append((name, expect, d, ok))
         det_total = sum(len(c) for c in per_cam)
         print(f"  [{'OK ' if ok else 'MISS'}] {name:20s} expect {expect:6s} -> {d['verdict']:6s}"
-              f" | tracks(3cam)={det_total} fused={d['fused_counts']}"
+              f" | tracks(2cam)={det_total} fused={d['fused_counts']}"
               f" unseen={d['unseen_paid_items']}")
         for f in d["flags"]:
             print(f"           FLAG: {f['detail']}")
@@ -158,7 +159,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="dataset/images")
     ap.add_argument("--cutouts", default="out/cut_rembg")
-    ap.add_argument("--weights", default="runs/detect/runs/prod_det_gpu/weights/best.pt")
+    ap.add_argument("--weights", default="runs/detector/best.pt")
     ap.add_argument("--onnx", default="dino_arc.onnx")  # DINOv2+ArcFace (padded, enriched gallery)
     ap.add_argument("--device", default="0")
     args = ap.parse_args()

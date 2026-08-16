@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
-WEIGHTS = "runs/detect/runs/prod_det_gpu/weights/best.pt"
+WEIGHTS = "runs/detector/best.pt"
 
 
 def main():

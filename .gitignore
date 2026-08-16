@@ -3,6 +3,7 @@ cjs_dataset/
 dataset/
 dataset_paired/
 detect_data/
+cart_dataset/
 out/
 service_products/
 service_products.zip
