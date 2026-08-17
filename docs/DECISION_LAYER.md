@@ -37,16 +37,26 @@ The recognition step already restricts each object to the cart's receipt SKUs, s
 
 ## 2. Start from what exists
 
-`match.py` already implements a first version of this:
+> **`docs/CONTRACT_v1.1.md` is the authoritative interface.** Section 1 below
+> predates it; where they disagree, the contract wins. The old `match.py`
+> helpers (`decide_cart`, `verify_cart`, `match_frame_crops`,
+> `aggregate_tracks`) have been deleted — they mixed vision and decision
+> concerns, which is exactly what the contract separates.
 
-- `decide_cart(tracks, receipt, pass_sim, review_sim, min_frames)` — 3-way decision
-  with confidence bands, quantity check, and occlusion tolerance.
-- `pipeline.py: fuse_and_decide(...)` — fuses the 2 cameras (max count per SKU) and
-  returns the verdict.
+- **Input**: `VisionObservation` JSON (contract §3). Vision hands you instances
+  with the full `candidates` similarity vector — no verdict, no band, no
+  threshold interpretation. Similarity thresholds are *yours* (contract §1).
+- **Reference implementation**: `cartgate/verification/reference_verify.py`
+  (`verify(observation, receipt) -> GateVerdict`). It implements contract §5:
+  global Hungarian assignment when `cross_camera_resolved` is true, and a
+  conservative per-camera max/min count when it is false. This is the starting
+  point for `VerificationService` in PR #1.
+- **Boundary test**: `tests/test_boundary.py` — 6 scenarios × 2 fusion modes,
+  crossing a real `json.dumps`/`loads` so no Python objects are shared.
 
 These are rule-based and calibrated on synthetic data. Your job is to harden this
-into something that holds up on real footage. Read those two functions first; the
-rest of this doc explains the design and where to take it.
+into something that holds up on real footage. Read `reference_verify.verify()`
+first; the rest of this doc explains the design and where to take it.
 
 ---
 

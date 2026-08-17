@@ -1,28 +1,34 @@
-"""Single source of truth for the runtime thresholds.
+"""Runtime knobs, split by which side of the contract owns them.
 
-These were previously duplicated in scripts/pipeline.py, scripts/viz_recognition.py
-and cartgate/match.py with three different value sets. Import them from here so a
-deployment recalibration is a one-file change.
-
-All of these are calibrated on synthetic carts and MUST be re-tuned on real gate
-footage before deployment.
+docs/CONTRACT_v1.1.md §1 draws the line: vision answers "what is there, how
+many"; the decision layer answers "does it match the receipt". Thresholds
+follow that same split, so recalibrating similarity on real footage touches the
+decision layer only and leaves the vision pipeline untouched.
 """
+from cartgate.vision_fusion import MERGE_RADIUS_CM, MIN_FRAMES   # noqa: F401  (re-export)
 
-# --- recognition similarity bands (cosine similarity against the receipt gallery) ---
-PASS_SIM = 0.55      # >= this: confident enough to count as a paid item
-REVIEW_SIM = 0.42    # >= this but < PASS_SIM: ambiguous -> human review
+# ---------------------------------------------------------------------------
+# VISION-owned — observation quality and geometry
+# ---------------------------------------------------------------------------
+DET_CONF = 0.25          # YOLO confidence threshold
+TRACK_IOU = 0.4          # IoU needed to associate a detection with a tracked object
+# MIN_FRAMES / MERGE_RADIUS_CM are defined in cartgate/vision_fusion.py (the
+# module that acts on them) and re-exported here so there is one definition.
 
-# --- track stability ---
-MIN_FRAMES = 2       # a track seen in fewer frames never accuses anyone
+GATE_ID = "demo-gate-1"  # per-deployment identity stamped into VisionObservation
 
-# --- detector ---
-DET_CONF = 0.25      # YOLO confidence threshold
-TRACK_IOU = 0.4      # IoU needed to associate a detection with a tracked object
-
-# --- gate identity (overridden per deployment) ---
-GATE_ID = "demo-gate-1"
+# ---------------------------------------------------------------------------
+# DECISION-owned — "how similar is similar enough" is a judgement, not a measurement
+# ---------------------------------------------------------------------------
+# The authoritative copy lives in cartgate/verification/reference_verify.py as
+# SIM_STRONG / SIM_WEAK; recalibrate there. These are kept only for demo and
+# visualization tooling (scripts/viz_recognition.py colours boxes by band) and
+# must NOT be used inside the vision pipeline — it reports similarities, it
+# does not interpret them.
+PASS_SIM = 0.55          # == reference_verify.SIM_STRONG
+REVIEW_SIM = 0.42        # == reference_verify.SIM_WEAK
 
 
 def band(sim: float) -> str:
-    """strong / weak / none, the confidence band a similarity falls into."""
+    """strong / weak / none. DECISION-side interpretation; demo tooling only."""
     return "strong" if sim >= PASS_SIM else ("weak" if sim >= REVIEW_SIM else "none")

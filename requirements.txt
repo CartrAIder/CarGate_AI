@@ -3,7 +3,7 @@
 torch>=2.5
 torchvision
 timm
-onnxruntime            # or onnxruntime-gpu if you have a CUDA GPU
+onnxruntime-gpu==1.22.0  # CUDA 12 build; 1.23+ needs CUDA 13 (see docs/RUNTIME_ENV.md)
 opencv-contrib-python
 ultralytics
 rembg
