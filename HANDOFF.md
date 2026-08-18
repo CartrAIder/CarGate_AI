@@ -8,7 +8,7 @@ cloud zips. Below is what to send and to whom.
 | # | Item | Size | Contents | For |
 |---|------|------|----------|-----|
 | 1 | GitHub repo | — | all code (`cartgate/`, `scripts/`, `docs/`, configs, `products.csv`) | everyone |
-| 2 | `cart_dataset.zip` | ~360M | 2-camera cart images (6000 = 3000/direction): `carts.json` (decision benchmark) + YOLO `labels/` + `data.yaml` (detector training) | decision-layer teammate · detector training |
+| 2 | `cart_dataset.zip` | ~310M | format **v2**: 500 carts x 2 cameras x 4 consecutive frames (4000 imgs) + `carts.json` (decision benchmark, tracking GT) + `gate_calib.json` (per-camera homography) + YOLO `labels/` + `data.yaml` | decision-layer teammate · detector training |
 | 3 | `cjs_data_bundle.zip` | ~460M | `dataset/` (gallery) + models (`dino_arc.onnx`, detector `best.pt`, `yolo11n.pt`) + `out/cut_rembg/` (recognition-training cutouts) + `products.csv` | running / retraining the vision pipeline |
 | 4 | `service_products.zip` | small | product master (barcode · name · category) | backend teammate |
 
@@ -32,4 +32,7 @@ python scripts/pipeline.py                 # needs bundle #3
   + #3 for the gallery, recognition cutouts and current models.
 - **Backend**: #4 (product master) — `sku_id` links it to the vision output.
 
-Regenerate the cart dataset: `python scripts/make_cart_dataset.py --num 3000 --cameras 2`.
+Regenerate the cart dataset: `python scripts/make_cart_dataset.py --num 500 --frames 4 --cameras 2`.
+
+Start any interface work from `docs/CONTRACT_v1.1.md`; `scripts/eval_carts.py`
+reports the operating point (false-stop / miss) the whole stack currently sits at.

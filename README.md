@@ -31,26 +31,36 @@
 ```
 cjs/
 ├─ cartgate/              # 라이브러리 (import 되는 모듈)
-│   ├─ embed.py           #   임베딩 백엔드 (classical + ONNX)
-│   ├─ gallery.py         #   SKU별 임베딩 갤러리 생성
-│   ├─ match.py           #   크롭↔갤러리 매칭 · 영수증 대조 · 판정
-│   ├─ synth.py           #   검출기 학습용 합성 카트 장면
+│   ├─ embed.py           #   임베딩 백엔드 (classical + ONNX, 배치 추론)
+│   ├─ gallery.py         #   SKU별 임베딩 갤러리 (지문 기반 캐시)
+│   ├─ match.py           #   크롭↔갤러리 코사인 유사도 (비전 몫만 남김)
+│   ├─ vision_fusion.py   #   2캠 인스턴스 융합 + VisionObservation  ← 비전 소유
+│   ├─ calibrate_plane.py #   카트 평면 캘리브레이션 (호모그래피)   ← 비전 소유
+│   ├─ config.py          #   임계값 (비전/판정 소유 구분)
+│   ├─ synth.py           #   합성 카트 장면 (시간 일관 · 카메라 고정)
 │   ├─ segment.py         #   누끼 매팅 (rembg / grabcut)
-│   └─ train_embed.py     #   MobileNetV3 베이스라인 + 공용 augmentation 유틸
+│   ├─ train_embed.py     #   MobileNetV3 베이스라인 + 공용 augmentation 유틸
+│   └─ verification/      #   판정 레이어  ← 팀원 소유
+│       └─ reference_verify.py   영수증 대조 참조 구현 (전역 할당 / conservative)
 │
 ├─ scripts/               # 실행 진입점 (리포 루트에서 실행)
 │   ├─ ingest.py                # 원본 사진 → dataset/
-│   ├─ make_cart_dataset.py     # 합성 카트 데이터셋 (2캠 대각선) — 판정 벤치마크 + 검출기 학습 겸용
+│   ├─ make_cart_dataset.py     # 합성 카트 데이터셋 + gate_calib.json
 │   ├─ train_detector.py        # 검출기 학습 (YOLO, cart_dataset/data.yaml)
 │   ├─ train_recognition.py     # 인식 임베더 학습 → dino_arc.onnx
-│   ├─ make_paired.py           # 원본 + BiRefNet 누끼 pair 생성
-│   ├─ pipeline.py              # 엔드투엔드 데모 (검출→인식→융합→판정)
+│   ├─ pipeline.py              # 엔드투엔드 (검출→추적→인식→융합→관측 JSON)
+│   ├─ eval_carts.py            # 500카트 전수 평가 (false-stop / miss)
 │   ├─ viz_recognition.py       # 인식 결과 시각화
 │   ├─ stress_test.py           # 강건성 스윕 (혼잡도 × 화질)
+│   ├─ make_paired.py           # 원본 + BiRefNet 누끼 pair 생성
 │   ├─ build_handoff.py         # 백엔드용 상품 마스터 (xlsx/csv)
 │   └─ export_deploy.py         # Jetson용 ONNX export
 │
-├─ docs/DECISION_LAYER.md  # 판정 레이어 스펙 (팀원용)
+├─ tests/test_boundary.py   # 비전→JSON→판정 경계 테스트 (6 시나리오 × 2 융합)
+├─ docs/
+│   ├─ CONTRACT_v1.1.md     # 비전↔판정 인터페이스 계약 (기준 문서)
+│   ├─ DECISION_LAYER.md    # 판정 레이어 설계 노트 (팀원용)
+│   └─ RUNTIME_ENV.md       # onnxruntime-gpu / CUDA / Jetson 주의사항
 ├─ products.csv            # 상품 마스터 (sku_id · 상품명 · EAN-13 바코드)
 ├─ pyproject.toml          # 패키지 정의 (pip install -e .)
 ├─ requirements.txt
@@ -106,6 +116,9 @@ python scripts/viz_recognition.py
 # 강건성 스윕: 혼잡도 × 화질별 인식/e2e
 python scripts/stress_test.py
 
+# 500카트 벤치마크 전수 평가 (false-stop / miss rate)  → out/eval_carts.json
+python scripts/eval_carts.py --limit 500 --calib cart_dataset/gate_calib.json
+
 # 백엔드용 상품 마스터 (xlsx + csv)  → service_products/
 python scripts/build_handoff.py --no-images
 ```
@@ -113,25 +126,42 @@ python scripts/build_handoff.py --no-images
 재학습 (GPU):
 
 ```bash
-python scripts/make_cart_dataset.py --num 3000 && python scripts/train_detector.py   # 검출기
+python scripts/make_cart_dataset.py --num 500 --frames 4 && python scripts/train_detector.py   # 검출기
 python scripts/train_recognition.py                                                  # 인식 → dino_arc.onnx
 ```
 
-## 현재 성능 (합성 데이터 기준)
+## 현재 성능
 
-> 아래 mAP·top-1 수치는 **학습 당시 기록을 옮긴 것으로, 재검증 로그가 리포에 남아 있지
-> 않습니다**(`runs/`에는 `detector/best.pt` 하나뿐). 인용 전 재평가를 권장합니다.
+### 500카트 벤치마크 전수 평가 (2026-08-17, `scripts/eval_carts.py`)
 
-- **검출기**: mAP50 ≈ 0.94, mAP50-95 ≈ 0.80 *(합성 데이터 기준, 재검증 로그 없음)*
-- **인식** (실제 검출 크롭, 영수증 제한 top-1): **90.8%** *(합성 데이터 기준, 재검증 로그 없음)*
-  (DINOv2+ArcFace + 합성뷰 보강 갤러리; MobileNetV3 베이스라인은 81.8%)
-- **스트레스** (인식 top-1): 깨끗 82-94%, 저해상도 75-91%, 최악 62-77% (혼잡도별)
-  *(합성 데이터 기준, 재검증 로그 없음)*
-- **게이트 시나리오 데모** (`scripts/pipeline.py`, seed 7): **4개 중 3개 기대대로**.
-  정상 카트가 인식 오류(SKU 혼동)로 수량 초과 FLAG가 되는 오탐이 재현됩니다
-  (2026-08-16 실측). 전역 할당 기반 융합으로 교체해 해소할 예정.
+지표는 정확도가 아니라 **운영점**입니다. REVIEW는 손님 입장에서 멈추는 것과 같으므로
+false-stop에 포함합니다.
 
-전부 합성 카트 기준입니다. 가장 큰 남은 과제는 **실제 게이트 영상으로의 검증과 임계값 보정**.
+| 융합 | 집계 | SIM_STRONG/WEAK | false-stop | miss |
+|---|---|---|---|---|
+| asymmetric | max | 0.55 / 0.42 | 56.1% | 21.5% |
+| plane_match | max | 0.55 / 0.42 | **55.7%** | 21.5% |
+| plane_match | mean | 0.55 / 0.42 | 64.3% | **15.6%** |
+
+임계값·집계·융합을 54조합 스윕해도 **false-stop이 40.8% 아래로 내려가지 않습니다.**
+현재 상태로는 배포 불가이며, 병목은 융합이나 임계값이 아니라 **인식**입니다:
+
+- 실제 트랙 기준 **인식 top-1 72~74%** (영수증 후보 2~5개 중에서). 후보가 5개면 64.5%
+- 오인식의 **68%가 sim ≥ 0.55로 "자신 있게" 틀립니다** → 신뢰도 밴드로 못 거릅니다
+- 검출/추적은 병목이 아닙니다: 트랙 수 = GT 객체 수의 **1.04배**, 미매칭 4.5%
+
+> 과거 README의 **인식 90.8%**는 프레임마다 물체 배치가 새로 뽑히던 v1 합성 데이터에서
+> 나온 값입니다. v2는 한 장면을 여러 프레임 촬영하므로 가려진 물체는 계속 가려져 있고,
+> 이쪽이 실제 게이트에 가깝습니다. 검출기 mAP50 ≈ 0.94 / mAP50-95 ≈ 0.80은 v1 학습 당시
+> 기록이며 재검증 로그가 없습니다.
+
+### 지연 (L40S, onnxruntime-gpu CUDA EP)
+
+- 검출기 1프레임 6.9 ms · 임베더 1크롭 3.6 ms (배치 8일 때 1.72 ms/크롭)
+- 카트 1대(2캠 × 4프레임) 실측 **250 ms**, 첫 카트만 CUDA 워밍업으로 1.2~1.5 s
+
+전부 합성 카트 기준입니다. 가장 큰 남은 과제는 **인식 정확도**이고, 그다음이
+**실제 게이트 영상으로의 검증과 임계값 보정**입니다.
 
 ## 참고
 

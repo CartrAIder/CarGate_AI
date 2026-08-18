@@ -153,16 +153,40 @@ def _paste_alpha(canvas: np.ndarray, rgba: np.ndarray, cx: int, cy: int):
     return full
 
 
-def _apply_camera(frame: "Frame", direction: float, rng: np.random.Generator) -> "Frame":
+CART_PLANE_CM = (90.0, 60.0)     # the cart opening the canvas stands for
+
+
+def camera_params(direction: float, rng: np.random.Generator | None = None,
+                  W: int = 640, jitter: bool = False) -> tuple[float, float]:
+    """A camera's viewpoint: (pinch, shift) in pixels.
+
+    Deployment geometry is FIXED — the gate cameras are bolted in place, which is
+    the only reason a single homography per camera can exist. So this is
+    deterministic by default; jitter=True re-samples it for training-time
+    augmentation, where varied viewpoints help the detector generalize.
+    """
+    if jitter and rng is not None:
+        return (rng.uniform(0.14, 0.22) * W, direction * rng.uniform(0.06, 0.12) * W)
+    return (0.18 * W, direction * 0.09 * W)
+
+
+def camera_matrix(direction: float, W: int, H: int,
+                  params: tuple[float, float] | None = None) -> np.ndarray:
+    """Perspective transform from the top-down cart canvas to this camera's view.
+    Exposed so a calibration can be derived from known plane points."""
+    pinch, shift = params if params is not None else camera_params(direction, W=W)
+    src = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
+    dst = np.float32([[pinch + shift, 0], [W - pinch + shift, 0], [W, H], [0, H]])
+    return cv2.getPerspectiveTransform(src, dst)
+
+
+def _apply_camera(frame: "Frame", direction: float, rng: np.random.Generator,
+                  params: tuple[float, float] | None = None) -> "Frame":
     """Warp a top-down composite to an upper-diagonal viewpoint (the deployment
     setup: two cameras angled down from opposite sides). direction -1/+1 selects
     the side. Boxes are re-derived by warping their corners."""
     H, W = frame.image.shape[:2]
-    pinch = rng.uniform(0.14, 0.22) * W                   # top edge recedes (looking down/forward)
-    shift = direction * rng.uniform(0.06, 0.12) * W       # lean toward one side
-    src = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
-    dst = np.float32([[pinch + shift, 0], [W - pinch + shift, 0], [W, H], [0, H]])
-    M = cv2.getPerspectiveTransform(src, dst)
+    M = camera_matrix(direction, W, H, params)
     frame.image = cv2.warpPerspective(frame.image, M, (W, H), borderMode=cv2.BORDER_REFLECT)
     kept = []
     for o in frame.objects:
@@ -177,62 +201,114 @@ def _apply_camera(frame: "Frame", direction: float, rng: np.random.Generator) ->
     return frame
 
 
+def _build_layout(cart_contents: list[str], cutouts: dict[str, list[np.ndarray]],
+                  rng: np.random.Generator, W: int, H: int) -> list[dict]:
+    """Sample ONE physical arrangement of the cart: appearance, size and place
+    per item, with a fixed stacking order. Every camera films this same pile and
+    every frame re-renders it, which is what makes cross-camera merging and
+    frame-to-frame tracking meaningful."""
+    ccx, ccy = rng.uniform(0.35, 0.65) * W, rng.uniform(0.35, 0.65) * H  # pile centre
+    layout = []
+    for track_id in rng.permutation(len(cart_contents)):
+        sku = cart_contents[track_id]
+        rgba = cutouts[sku][rng.integers(len(cutouts[sku]))].copy()
+        rel = (SIZE_CM.get(sku, 15) / 15.0) ** 0.4            # mild size hint (compressed)
+        depth = rng.uniform(0.65, 1.5)                        # pile depth / near-far dominates
+        target = float(np.clip(0.28 * min(W, H) * rel * depth, 0.10 * min(W, H), 0.60 * min(W, H)))
+        s = target / max(rgba.shape[:2])
+        rgba = cv2.resize(rgba, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        if rng.random() < 0.6:
+            rgba = _perspective_jitter(rgba, rng)             # multi-view
+        rgba = rotate_rgba(rgba, float(rng.uniform(0, 360)))
+        rgba = _harmonize(rgba, rng)                          # match dim cart lighting
+        rgba = _feather(rgba)                                 # soft edges
+        if rng.random() < 0.85:                               # dense central pile (loaded cart)
+            cx = float(np.clip(rng.normal(ccx, 0.12 * W), 0, W))
+            cy = float(np.clip(rng.normal(ccy, 0.12 * H), 0, H))
+        else:                                                 # near edge (partial view)
+            cx, cy = rng.uniform(0.1, 0.9) * W, rng.uniform(0.1, 0.9) * H
+        layout.append({"sku": sku, "track_id": int(track_id), "rgba": rgba, "cx": cx, "cy": cy})
+    return layout
+
+
+def _render(layout: list[dict], bg: np.ndarray, offsets: list[tuple],
+            vis_thresh: float) -> Frame:
+    """Composite the layout onto a copy of bg with per-item offsets, and derive
+    occlusion-aware boxes (an item buried by the items stacked on top of it gets
+    no label)."""
+    canvas = bg.copy()
+    H, W = canvas.shape[:2]
+    placed = []  # (track_id, sku, full-canvas alpha)
+    for item, (dx, dy) in zip(layout, offsets):
+        alpha = _paste_alpha(canvas, item["rgba"], int(item["cx"] + dx), int(item["cy"] + dy))
+        if alpha is not None and alpha.any():
+            placed.append((item["track_id"], item["sku"], alpha))
+
+    frame = Frame(image=canvas)
+    for idx, (tid, sku, alpha) in enumerate(placed):
+        occ = np.zeros((H, W), bool)
+        for _, _, a2 in placed[idx + 1:]:
+            occ |= a2 > 0
+        vis = (alpha > 0) & ~occ
+        area = int((alpha > 0).sum())
+        if area == 0 or vis.sum() / area < vis_thresh:        # mostly buried -> no label
+            continue
+        ys, xs = np.where(vis)
+        frame.objects.append(PlacedObject(
+            sku=sku, track_id=tid,
+            box=(int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))))
+    return frame
+
+
+def synth_cart_views(cart_contents: list[str], cutouts: dict[str, list[np.ndarray]],
+                     rng: np.random.Generator, cameras=(-1.0, 1.0), n_frames: int = 4,
+                     size: tuple = (640, 640), vis_thresh: float = 0.18,
+                     drift_px: float = 6.0,
+                     jitter_camera: bool = False) -> dict[float, list[Frame]]:
+    """One cart, filmed by fixed cameras over consecutive frames.
+
+    * the pile is sampled once, so both cameras see the SAME physical objects
+    * camera viewpoints are fixed (jitter_camera=True re-samples them for
+      detector-training variety), so one homography per camera exists — a
+      per-frame or per-cart random warp would make calibration meaningless
+    * between frames the whole cart translates a few pixels (it is rolling
+      through the gate) plus a small per-item settle -> a tracker has continuous
+      motion to follow instead of an unrelated pile every frame
+
+    Returns {camera direction: [Frame, ...]}, oldest frame first.
+    """
+    W, H = size
+    layout = _build_layout(cart_contents, cutouts, rng, W, H)
+    bg = make_cart_background(W, H, rng)                      # same cart interior for all views
+    vx, vy = rng.normal(0, drift_px), rng.normal(0, drift_px)  # constant cart velocity
+    jitter = [[(rng.normal(0, 1.2), rng.normal(0, 1.2)) for _ in layout]
+              for _ in range(n_frames)]
+
+    views = {}
+    for d in cameras:
+        d = float(d)
+        params = camera_params(d, rng, W, jitter=jitter_camera)   # fixed per camera, not per frame
+        frames = []
+        for fi in range(n_frames):
+            offsets = [(vx * fi + jx, vy * fi + jy) for jx, jy in jitter[fi]]
+            frame = _render(layout, bg, offsets, vis_thresh)
+            frame = _apply_camera(frame, d, rng, params=params)    # upper-diagonal viewpoint
+            frame.image = _motion_blur(frame.image, rng)          # rolling cart
+            k = 3 if rng.random() < 0.5 else 5
+            frame.image = cv2.GaussianBlur(frame.image, (k, k), 0)
+            frames.append(frame)
+        views[d] = frames
+    return views
+
+
 def synth_cart_frames(cart_contents: list[str], cutouts: dict[str, list[np.ndarray]],
                       rng: np.random.Generator, n_frames: int = 2,
                       size: tuple = (960, 720), vis_thresh: float = 0.18,
                       cam_dirs: list | None = None) -> list[Frame]:
-    """cart_contents: list of SKU ids (repeats = quantity).
-    cutouts: sku -> list of RGBA cutouts (one per available view).
-    vis_thresh: drop an object's box if less than this fraction stays visible.
-    cam_dirs: per-frame upper-diagonal camera direction (-1/+1); random if None.
-    """
-    W, H = size
-    frames = []
-    for fi in range(n_frames):
-        direction = cam_dirs[fi] if cam_dirs is not None else float(rng.choice([-1.0, 1.0]))
-        canvas = make_cart_background(W, H, rng)
-        placed = []  # (track_id, sku, full-canvas alpha)
-        ccx, ccy = rng.uniform(0.35, 0.65) * W, rng.uniform(0.35, 0.65) * H  # pile centre
-        for track_id in rng.permutation(len(cart_contents)):
-            sku = cart_contents[track_id]
-            rgba = cutouts[sku][rng.integers(len(cutouts[sku]))].copy()
-            rel = (SIZE_CM.get(sku, 15) / 15.0) ** 0.4            # mild size hint (compressed)
-            depth = rng.uniform(0.65, 1.5)                        # pile depth / near-far dominates
-            target = float(np.clip(0.28 * min(W, H) * rel * depth, 0.10 * min(W, H), 0.60 * min(W, H)))
-            s = target / max(rgba.shape[:2])
-            rgba = cv2.resize(rgba, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-            if rng.random() < 0.6:
-                rgba = _perspective_jitter(rgba, rng)             # multi-view
-            rgba = rotate_rgba(rgba, float(rng.uniform(0, 360)))
-            rgba = _harmonize(rgba, rng)                          # match dim cart lighting
-            rgba = _feather(rgba)                                 # soft edges
-            if rng.random() < 0.85:                               # dense central pile (loaded cart)
-                cx = int(np.clip(rng.normal(ccx, 0.12 * W), 0, W))
-                cy = int(np.clip(rng.normal(ccy, 0.12 * H), 0, H))
-            else:                                                 # near edge (partial view)
-                cx, cy = int(rng.uniform(0.1, 0.9) * W), int(rng.uniform(0.1, 0.9) * H)
-            alpha = _paste_alpha(canvas, rgba, cx, cy)
-            if alpha is not None and alpha.any():
-                placed.append((int(track_id), sku, alpha))
-
-        # occlusion-aware boxes: an item is hidden by everything dropped AFTER it
-        frame = Frame(image=canvas)
-        for idx, (tid, sku, alpha) in enumerate(placed):
-            occ = np.zeros((H, W), bool)
-            for _, _, a2 in placed[idx + 1:]:
-                occ |= a2 > 0
-            vis = (alpha > 0) & ~occ
-            area = int((alpha > 0).sum())
-            if area == 0 or vis.sum() / area < vis_thresh:        # mostly buried -> no label
-                continue
-            ys, xs = np.where(vis)
-            frame.objects.append(PlacedObject(
-                sku=sku, track_id=tid,
-                box=(int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))))
-
-        frame = _apply_camera(frame, direction, rng)              # upper-diagonal viewpoint
-        frame.image = _motion_blur(frame.image, rng)              # rolling cart
-        k = 3 if rng.random() < 0.5 else 5
-        frame.image = cv2.GaussianBlur(frame.image, (k, k), 0)
-        frames.append(frame)
-    return frames
+    """Single-camera convenience wrapper over synth_cart_views: n_frames
+    consecutive frames from ONE camera. cam_dirs picks the side (a list is
+    accepted for compatibility; its first entry is used, since one camera has
+    one viewpoint)."""
+    d = float(cam_dirs[0]) if cam_dirs else float(rng.choice([-1.0, 1.0]))
+    return synth_cart_views(cart_contents, cutouts, rng, cameras=(d,), n_frames=n_frames,
+                            size=size, vis_thresh=vis_thresh)[d]

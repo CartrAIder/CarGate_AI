@@ -24,14 +24,15 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from cartgate import config, vision_fusion
+from cartgate import calibrate_plane, config, vision_fusion
 from cartgate.embed import get_embedder
 from cartgate.gallery import build_gallery
-from cartgate.synth import synth_cart_frames
+from cartgate.synth import synth_cart_views
 from cartgate.match import sku_similarity
 from cartgate.verification import reference_verify   # demo self-test only
 
 CALIB_PATH = "gate_calib.json"
+CROP_DIR = "out/crops"   # evidence store for cited instances
 EMBED_BATCH = 8          # measured sweet spot on L40S: 1.72 ms/crop (vs 3.6 looped)
 
 # How a track's per-frame similarities collapse into ONE number per SKU.
@@ -58,18 +59,60 @@ def load_cutouts(cut_dir: str) -> dict:
 def load_fusion(calib_path: str = CALIB_PATH):
     """PlaneMatchFusion when calibrated, AsymmetricFusion otherwise.
 
-    gate_calib.json format (written by the calibration tool, still to come):
-        {"homographies": {"cam_left": [[..3x3..]], "cam_right": [[..]]},
-         "merge_radius_cm": 12.0}
+    The file is whatever cartgate.calibrate_plane.save() wrote: per-camera
+    homographies (image px -> cart-plane cm) plus a meta block. The merge radius
+    comes from meta.merge_radius_cm when calibration measured one
+    (check_cross_camera reports a suggestion), else the module default.
     """
     p = Path(calib_path)
     if not p.exists():
         return vision_fusion.AsymmetricFusion()
-    calib = json.loads(p.read_text())
-    H = {c: np.array(m, np.float64) for c, m in calib["homographies"].items()}
+    H = calibrate_plane.load(str(p))
+    meta = json.loads(p.read_text()).get("meta", {})
     return vision_fusion.PlaneMatchFusion(
-        H, merge_radius_cm=float(calib.get("merge_radius_cm",
-                                           vision_fusion.MERGE_RADIUS_CM)))
+        H, merge_radius_cm=float(meta.get("merge_radius_cm",
+                                          vision_fusion.MERGE_RADIUS_CM)))
+
+
+def save_evidence(observation: dict, verdict: dict, crop_store: dict,
+                  root: str = CROP_DIR) -> int:
+    """Write the crops the decision layer actually cited and fill their crop_refs.
+
+    Path convention (evidence store, contract §4):
+        out/crops/{transaction_id}/{instance_id}_{camera_id}.jpg
+
+    Only instances behind a FLAG or REVIEW are stored — a clean cart needs no
+    evidence. The path is deterministic, so a production capture service can
+    write these during capture instead of after the verdict.
+    """
+    reasons = verdict.get("reasons", [])
+    cited = {r["instance_id"] for r in reasons if r.get("instance_id")}
+    sku_only = {r["sku_id"] for r in reasons if r.get("sku_id") and not r.get("instance_id")}
+    for inst in observation["instances"]:          # conservative mode cites a SKU, not an instance
+        cand = inst.get("candidates") or {}
+        if cand and sku_only and max(cand, key=cand.get) in sku_only:
+            cited.add(inst["instance_id"])
+    if not cited:
+        return 0
+
+    tx = observation["transaction_id"]
+    outdir = Path(root) / tx
+    outdir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for inst in observation["instances"]:
+        if inst["instance_id"] not in cited:
+            continue
+        refs = {}
+        for tid in inst["track_ids"]:
+            cam, crop = crop_store.get(tid, (None, None))
+            if crop is None or not crop.size:
+                continue
+            fn = f"{inst['instance_id']}_{cam}.jpg"
+            cv2.imwrite(str(outdir / fn), crop)
+            refs[cam] = f"{root}/{tx}/{fn}"
+            saved += 1
+        inst["crop_refs"] = refs
+    return saved
 
 
 def _aggregate(sims: list[float], how: str | None = None) -> float:
@@ -84,71 +127,88 @@ def _aggregate(sims: list[float], how: str | None = None) -> float:
     return float(np.mean(sorted(sims, reverse=True)[:2]))     # top2
 
 
-def _iou(a, b):
-    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
-    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
-    ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
-    return inter / ua if ua > 0 else 0.0
+def _reset_tracker(model) -> None:
+    """ByteTrack state is per camera sequence: carry it across a camera's frames,
+    never across cameras or carts (ids would leak between physical scenes)."""
+    pred = getattr(model, "predictor", None)
+    for t in getattr(pred, "trackers", None) or []:
+        if hasattr(t, "reset"):
+            t.reset()
 
 
 def resolve_camera(model, frames, embedder, gallery, receipt_skus, dev,
-                   camera_id: str = "cam0") -> list[vision_fusion.Detection]:
-    """One camera's frames -> one Detection per tracked object.
+                   camera_id: str = "cam0",
+                   raw_out: dict | None = None) -> tuple[list[vision_fusion.Detection], dict]:
+    """One camera's frame sequence -> one Detection per tracked object.
 
-    Crops are embedded in batches (the ONNX graph has a dynamic batch axis),
-    and every receipt SKU's similarity is kept — the decision layer's global
-    assignment needs the full vector, not the argmax. Candidates are restricted
-    to this cart's receipt by design (contract §3); never the full catalog.
+    Object identity comes from ByteTrack (ultralytics `model.track`), so nothing
+    here reads the synthetic ground truth — the same code path works on real
+    footage. Crops are embedded in batches (the ONNX graph has a dynamic batch
+    axis), and every receipt SKU's similarity is kept: the decision layer's
+    global assignment needs the full vector, not the argmax. Candidates are
+    restricted to this cart's receipt by design (contract §3), never the full
+    catalog.
 
-    Object identity across frames uses IoU association to the synthetic GT as a
-    stand-in for ByteTrack (which would track from real 30fps video).
+    Returns (detections, {track_id: crop}) — the crop is kept so the evidence
+    store can save it if the decision layer ends up citing that instance.
+    raw_out, when given, receives {track_id: {sku: [per-frame sims]}} so an
+    offline sweep can re-aggregate without re-running the models.
     """
     rc = sorted(set(str(s) for s in receipt_skus))
     prefix = "L" if camera_id.endswith("left") else ("R" if camera_id.endswith("right") else "T")
+    mid = (len(frames) - 1) / 2.0        # stand-in for the QR trigger instant, see below
     tracks = defaultdict(lambda: {"cand": defaultdict(list), "n": 0,
-                                  "boxes": [], "confs": []})
-    for f in frames:
-        res = model.predict(f.image, conf=config.DET_CONF, verbose=False, device=dev)[0]
+                                  "obs": []})        # obs: (frame_idx, box, det_conf, crop)
+    _reset_tracker(model)
+    for fi, f in enumerate(frames):
+        res = model.track(f.image, conf=config.DET_CONF, persist=True,
+                          tracker="bytetrack.yaml", verbose=False, device=dev)[0]
+        if res.boxes is None or res.boxes.id is None:
+            continue                                 # nothing tracked in this frame
+        ids = res.boxes.id.cpu().numpy().astype(int)
         hits = []                                    # (track_id, box, det_conf, crop)
-        for box, det_conf in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.conf.cpu().numpy()):
+        for tid, box, det_conf in zip(ids, res.boxes.xyxy.cpu().numpy(),
+                                      res.boxes.conf.cpu().numpy()):
             bx = tuple(int(v) for v in box)
-            oid, best = None, config.TRACK_IOU       # associate detection -> GT object id
-            for o in f.objects:
-                j = _iou(bx, o.box)
-                if j > best:
-                    best, oid = j, o.track_id
-            if oid is None:
-                continue                             # spurious detection (no GT) -> skip
             crop = f.image[max(0, bx[1]):bx[3], max(0, bx[0]):bx[2]]
             if crop.size:
-                hits.append((oid, bx, float(det_conf), crop))
+                hits.append((int(tid), bx, float(det_conf), crop))
 
         for s in range(0, len(hits), EMBED_BATCH):   # batched embedding
             chunk = hits[s:s + EMBED_BATCH]
             vecs = embedder.embed_batch([h[3] for h in chunk])
-            for (oid, bx, det_conf, _), vec in zip(chunk, vecs):
-                t = tracks[oid]
+            for (tid, bx, det_conf, crop), vec in zip(chunk, vecs):
+                t = tracks[tid]
                 t["n"] += 1
                 for sku in rc:
                     t["cand"][sku].append(sku_similarity(vec, gallery, sku))
-                t["boxes"].append([int(v) for v in bx])
-                t["confs"].append(det_conf)
+                t["obs"].append((fi, [int(v) for v in bx], det_conf, crop))
 
-    dets = []
-    for tid, t in sorted(tracks.items(), key=lambda kv: str(kv[0])):
+    dets, crops = [], {}
+    for tid, t in sorted(tracks.items()):
         if not t["n"]:
             continue
+        # Representative observation = the frame closest to the QR trigger. The
+        # homography is calibrated for where the cart stands at t=0, and the cart
+        # keeps rolling, so a later frame projects to the wrong plane position.
+        # TODO: frames carry no capture timestamp yet -> use the middle frame of
+        # the burst as the trigger stand-in; switch to the real t=0 once the
+        # ring-buffer capture stamps frames.
+        fidx, box, _, crop = min(t["obs"], key=lambda o: abs(o[0] - mid))
+        track_id = f"{prefix}{tid}"
+        crops[track_id] = crop
+        if raw_out is not None:
+            raw_out[track_id] = {s: list(v) for s, v in t["cand"].items()}
         dets.append(vision_fusion.Detection(
             camera_id=camera_id,
-            track_id=f"{prefix}{tid}",
+            track_id=track_id,
             candidates={s: round(_aggregate(v), 4) for s, v in sorted(t["cand"].items())},
             n_frames=int(t["n"]),
-            box=tuple(t["boxes"][-1]),               # most recent box (closest to the gate)
-            det_conf=round(float(np.mean(t["confs"])), 3),
-            crop_ref=None,                           # evidence store not wired yet
+            box=tuple(box),
+            det_conf=round(float(np.mean([o[2] for o in t["obs"]])), 3),
+            crop_ref=None,                           # filled by save_evidence() on demand
         ))
-    return dets
+    return dets, crops
 
 
 def run(dataset, cutouts_dir, weights, onnx, dev, seed=7, out_path=None, n_frames=4,
@@ -180,13 +240,15 @@ def run(dataset, cutouts_dir, weights, onnx, dev, seed=7, out_path=None, n_frame
     for i, (name, cart, receipt, expect) in enumerate(scenarios):
         # frames stand in for camera capture -> generated OUTSIDE the timer, so
         # duration_ms measures only detect+recognize+fuse (what a gate would spend).
-        cam_frames = [(cam_id, synth_cart_frames(cart, cutouts, rng, n_frames=n_frames,
-                                                 size=(640, 640), cam_dirs=[d] * n_frames))
-                      for d, cam_id in cams]
+        views = synth_cart_views(cart, cutouts, rng, cameras=[d for d, _ in cams],
+                                 n_frames=n_frames, size=(640, 640))
         t0 = time.perf_counter()
-        per_cam = {cam_id: resolve_camera(model, frames, embedder, gallery,
-                                          list(receipt.keys()), dev, camera_id=cam_id)
-                   for cam_id, frames in cam_frames}
+        per_cam, crop_store = {}, {}
+        for d, cam_id in cams:
+            dets, crops = resolve_camera(model, views[float(d)], embedder, gallery,
+                                         list(receipt.keys()), dev, camera_id=cam_id)
+            per_cam[cam_id] = dets
+            crop_store.update({tid: (cam_id, crop) for tid, crop in crops.items()})
         obs = vision_fusion.build_observation(
             per_cam, fusion,
             transaction_id=f"TX-DEMO-{i:03d}",
@@ -198,12 +260,14 @@ def run(dataset, cutouts_dir, weights, onnx, dev, seed=7, out_path=None, n_frame
 
         # --- demo self-test ONLY: the decision side is the teammate's to own ---
         verdict = reference_verify.verify(obs, receipt)
+        n_saved = save_evidence(obs, verdict, crop_store)
         ok = verdict["verdict"] == expect
         results.append((name, expect, verdict, ok))
         n_inst = len(obs["instances"])
         print(f"  [{'OK ' if ok else 'MISS'}] {name:20s} expect {expect:6s} -> {verdict['verdict']:6s}"
               f" | instances={n_inst} counts={verdict['observed_counts']}"
-              f" mode={verdict['decision_mode']} {obs['duration_ms']}ms")
+              f" mode={verdict['decision_mode']} {obs['duration_ms']}ms"
+              f"{f' crops={n_saved}' if n_saved else ''}")
         for r in verdict["reasons"]:
             print(f"           {r['severity']}: {r['code']} {r.get('sku_id') or r.get('instance_id', '')}")
     n_ok = sum(r[3] for r in results)
