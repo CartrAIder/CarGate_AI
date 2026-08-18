@@ -44,7 +44,13 @@ EMBED_BATCH = 8          # measured sweet spot on L40S: 1.72 ms/crop (vs 3.6 loo
 #            single-lucky-frame outlier that "max" rewards.
 # This interacts with the decision layer's SIM_STRONG/SIM_WEAK, so the two must
 # be calibrated together on real footage (contract §1: thresholds are decision-owned).
-CAND_AGG = "top2"
+#
+# Measured over 500 carts (scripts/eval_carts.py): all three sit on the SAME
+# false-stop/miss curve — at a matched false-stop level their miss rates differ by
+# less than two standard errors, i.e. the choice re-parameterizes the threshold
+# rather than buying accuracy. "max" is kept because it is the simplest to explain
+# and holds the low-false-stop end of that curve.
+CAND_AGG = "max"
 
 
 def load_cutouts(cut_dir: str) -> dict:
